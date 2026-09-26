@@ -1,0 +1,35 @@
+# Ambiente virtual
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Credenciais e sessão (NUNCA commitar) — ficam no Keychain (service mcp-sei)
+.env
+.env.*
+credenciais.json
+*-session.json
+
+# Saídas com dados de processos reais
+saida/
+*.xlsx
+*.pdf
+*.zip
+*.docx
+processos/
+
+# Perfil do Chrome fica fora do repo (~/.mcp-sei-chrome-profile)
+# HTML/screenshots de diagnóstico
+sei_*.html
+sei_*.png
+
+# IDE / SO
+.vscode/
+.idea/
+*.swp
+.DS_Store
