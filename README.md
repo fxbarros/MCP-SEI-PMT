@@ -6,16 +6,17 @@
 
 <p align="center">
     <img alt="Python" src="https://img.shields.io/badge/python-3.12+-3776AB?logo=python&logoColor=white">
-    <img alt="Ferramentas" src="https://img.shields.io/badge/ferramentas-18-brightgreen">
+    <img alt="Ferramentas" src="https://img.shields.io/badge/ferramentas-20-brightgreen">
     <img alt="MCP" src="https://img.shields.io/badge/MCP-Claude%20Desktop-d97757">
     <img alt="REST" src="https://img.shields.io/badge/API%20REST-mod--wssei%20v2-blue">
     <img alt="Escrita" src="https://img.shields.io/badge/escrita-s%C3%B3%20com%20confirma%C3%A7%C3%A3o-8b0000">
+    <img alt="Licença" src="https://img.shields.io/badge/licen%C3%A7a-MIT-blue">
 </p>
 
 <p align="center">
     <a href="#-funcionalidades"><strong>Funcionalidades</strong></a>
     &middot;
-    <a href="#%EF%B8%8F-as-18-ferramentas"><strong>Ferramentas</strong></a>
+    <a href="#%EF%B8%8F-as-20-ferramentas"><strong>Ferramentas</strong></a>
     &middot;
     <a href="#-instala%C3%A7%C3%A3o"><strong>Instalação</strong></a>
     &middot;
@@ -24,6 +25,8 @@
     <a href="#-como-funciona-por-dentro"><strong>Por dentro</strong></a>
     &middot;
     <a href="#-seguran%C3%A7a"><strong>Segurança</strong></a>
+    &middot;
+    <a href="#-testes"><strong>Testes</strong></a>
     &middot;
     <a href="#%EF%B8%8F-avisos-importantes"><strong>Avisos</strong></a>
 </p>
@@ -44,7 +47,7 @@ Servidor [MCP](https://modelcontextprotocol.io) que liga o Claude Desktop ao **S
 - 🌙 **Lote noturno**: `proximo_pendente_nao_analisado` entrega um processo por vez, consultando a planilha para pular os já analisados
 - 🛡️ **Nunca assina, tramita, conclui ou exclui** — essas tools não existem, por decisão de projeto
 
-## 🛠️ As 18 ferramentas
+## 🛠️ As 20 ferramentas
 
 **Caixa e planilha** (Chrome headless)
 
@@ -81,6 +84,8 @@ Servidor [MCP](https://modelcontextprotocol.io) que liga o Claude Desktop ao **S
 | `listar_estilos_sei` | não | classes CSS do SEI e a marcação leve aceita por `formatar_html_sei` |
 | `formatar_html_sei` | não | texto simples → HTML do SEI; `Id. NNNNNNN` vira link *sei!* quando o documento está no processo |
 | `ler_documento_sei` | não | seções (cabeçalho/corpo/rodapé), versão e texto do corpo de um documento interno |
+| `listar_documentos_sei` | não | árvore do processo sem download: nº SEI, título, origem, formato, tamanho, unidade, assinado/restrito — com `filtro` e `ultimos` |
+| `baixar_documento_sei` | não | baixa **um** documento (anexo PDF/DOCX/imagem ou HTML de documento interno) em `Processos SEI/{numero}/documentos/` e devolve o texto — sem baixar o processo inteiro |
 | `criar_documento_sei` | **sim, com `confirmar=true`** | cria documento interno vazio no processo |
 | `editar_documento_sei` | **sim, com `confirmar=true`** | substitui o conteúdo de uma seção |
 
@@ -140,12 +145,42 @@ Reinicie o Claude Desktop. Para ver a janela do Chrome durante o uso, adicione `
 - *"Cria um despacho no processo X"* → prévia → **"pode criar"** → documento criado, sem assinatura
 - *"Coloca esse texto no corpo do despacho"* → prévia com o HTML → **"pode gravar"** → gravado; a assinatura continua sendo sua, no SEI
 
+## 🏗️ Estrutura do projeto
+
+```
+sei-mcp/
+├── README.md                    # este arquivo
+├── LICENSE                      # MIT
+├── pyproject.toml               # dependências, entry point (uv) e configuração do pytest
+├── setup_credenciais.py         # grava usuário, senha, órgão e unidade no Keychain (rodar 1x)
+├── docs/assets/banner.svg       # arte do repositório
+├── scripts/
+│   └── teste_unidade_concorrente.py   # teste manual, contra o SEI real, da armadilha da unidade ativa
+├── src/sei_mcp/
+│   ├── server.py                # as 20 tools, trava de confirmação, cliente único do Chrome
+│   ├── sei_rest.py              # API REST (mod-wssei): login, unidade reassegurada, consultas, download
+│   ├── sei_docs.py              # documentos internos: criar, seções, texto → HTML do SEI, árvore, um documento
+│   ├── sei_client.py            # Chrome headless (patchright): Controle de Processos, PDF/ZIP consolidado
+│   ├── analise.py               # texto do PDF e verificação de parecer assinado no PDF baixado
+│   ├── planilha.py              # controle.xlsx com as colunas amarelas preservadas
+│   └── modelos.py               # modelos .docx e minutas na pasta do processo
+└── tests/                       # suíte offline: wssei falso em memória, sem Keychain, sem Chrome
+```
+
 ## 🔬 Como funciona por dentro
 
-- **API REST (`sei_rest.py`, `sei_docs.py`)**: `POST /autenticar` → token → `POST /usuario/alterar/unidade` → consultas (`/processo/consultar`, `/documento/listar/{id}`, `/documento/listar/assinaturas/{id}`, `/documento/secao/listar`, `/documento/secao/alterar`). Token expirado é renovado sozinho.
+- **API REST (`sei_rest.py`, `sei_docs.py`)**: `POST /autenticar` → token → `POST /usuario/alterar/unidade` → consultas (`/processo/consultar`, `/documento/listar/{id}`, `/documento/listar/assinaturas/{id}`, `/documento/secao/listar`, `/documento/secao/alterar`). Token expirado é renovado sozinho. A unidade ativa é estado do **usuário** no servidor (não do token): qualquer outro token do mesmo usuário que troque de unidade afeta o servidor, por isso a unidade alvo é reaplicada antes de **cada** operação (ver docstring de `sei_rest.py`).
 - **Chrome headless (`sei_client.py`)**: patchright com o Chrome real e perfil persistente em `~/.mcp-sei-chrome-profile`; cliente único mantido vivo entre chamadas, thread dedicada e reset automático em erro. Usado só onde a API não chega (Controle de Processos completo, PDF/ZIP consolidado).
 - **Formatação (`formatar_html_sei`)**: parágrafos numerados com o número em negrito, tópicos (`I. RELATÓRIO`) em negrito, `> texto` vira `Citacao`, `EMENTA:` vira `Texto_Ementa`, `|c|`/`|d|`/`|e|` alinham; caracteres fora do ISO-8859-1 viram entidades (exigência do módulo).
 - **Seções**: o SEI exige todas as seções no POST de alteração; as de só leitura (timbre, referência) vão vazias e são reconstruídas pelo sistema.
+
+## ✅ Testes
+
+```bash
+uv run pytest
+```
+
+77 testes, 100% offline: nenhum fala com o SEI (um servidor `wssei` falso em memória responde às chamadas), nenhum lê o Keychain e nenhum abre o Chrome. Cobrem a armadilha validada em 02/10/2026 — a unidade ativa é do **usuário**, não do token: reasserção antes de cada operação, repetição única quando outro token troca a unidade no meio, reautenticação com a unidade reaplicada, trava compartilhada entre sessões — e as conversões puras: texto → HTML do SEI, entidades ISO-8859-1, links *sei!*, árvore e filtro de documentos, cache do download de um documento, nomes de arquivo, payload de seções, trava de confirmação das tools que escrevem.
 
 ## 🔒 Segurança
 
@@ -161,6 +196,8 @@ Reinicie o Claude Desktop. Para ver a janela do Chrome durante o uso, adicione `
 - Documentos externos (PDF anexado) não têm assinatura eletrônica listável — aparecem como não assinados na verificação rápida.
 - Uso pessoal, sem vínculo com a Prefeitura de Teresina ou com o Ministério da Gestão (mantenedor do SEI).
 
-## 📄 Licença
+## 📝 Licença e créditos
 
-MIT
+[MIT](LICENSE). Construído por [Fábio Ximenes Barros](https://github.com/fxbarros) com ajuda do [Claude](https://www.anthropic.com/claude), usando o [SDK Python do MCP](https://github.com/modelcontextprotocol/python-sdk), [httpx](https://www.python-httpx.org), [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright), [openpyxl](https://openpyxl.readthedocs.io), [python-docx](https://python-docx.readthedocs.io) e [pypdf](https://pypdf.readthedocs.io). Sem vínculo com a Prefeitura de Teresina nem com o Ministério da Gestão, mantenedor do SEI.
+
+<p align="center"><sub>Arte do banner: original — marca dos projetos MCP do autor.</sub></p>

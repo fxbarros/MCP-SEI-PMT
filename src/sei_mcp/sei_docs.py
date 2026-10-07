@@ -22,6 +22,8 @@ from __future__ import annotations
 import html
 import json
 import re
+import unicodedata
+from pathlib import Path
 from typing import Any
 
 from .sei_rest import SeiRest, SeiRestError
@@ -168,15 +170,13 @@ def formatar_html_sei(texto: str, mapa_ids: dict[str, str] | None = None) -> str
 # ---------------------------------------------------------------------------
 
 def _get(rest: SeiRest, path: str, params: dict | None = None) -> Any:
-    with rest._lock:
-        rest._garantir_unidade()
-        return rest._get(path, params)
+    # lock + unidade reassegurada a cada chamada ficam dentro do SeiRest
+    # (a unidade ativa é do usuário no servidor; ver docstring de sei_rest.py)
+    return rest.get(path, params)
 
 
 def _post(rest: SeiRest, path: str, data: dict) -> Any:
-    with rest._lock:
-        rest._garantir_unidade()
-        return rest._post(path, data)
+    return rest.post(path, data)
 
 
 def resolver_tipo(rest: SeiRest, tipo: str) -> tuple[str, str]:
@@ -336,3 +336,148 @@ def gravar_secoes(rest: SeiRest, id_documento: str, payload: list[dict[str, str]
         {"documento": id_documento, "secoes": json.dumps(payload, ensure_ascii=False), "versao": versao},
     )
     return {"mensagem": j.get("mensagem"), "data": j.get("data")}
+
+
+# ---------------------------------------------------------------------------
+# Árvore do processo e download de UM documento (só leitura, 05/10/2026)
+#
+# Motivo: para ler um único anexo não se baixa o processo inteiro. A árvore
+# vem de /documento/listar e o conteúdo de /documento/baixar/anexo/{id}, que
+# serve tanto externo (binário) quanto interno/formulário (HTML renderizado).
+# ---------------------------------------------------------------------------
+
+# tipoDocumento do wssei: X = externo (arquivo anexado), I = interno (editor),
+# A = formulário gerado pelo SEI (E-mail, Recibo Eletrônico de Protocolo)
+_ORIGEM = {"X": "externo", "I": "interno", "A": "formulario"}
+
+
+def arvore_processo(rest: SeiRest, numero: str) -> list[dict[str, Any]]:
+    """Documentos do processo na ordem da árvore, sem baixar nada."""
+    proc = rest.consultar_processo(numero)
+    saida: list[dict[str, Any]] = []
+    for ordem, d in enumerate(rest.listar_documentos(proc["IdProcedimento"]), 1):
+        a = d.get("atributos") or {}
+        st = a.get("status") or {}
+        tamanho = str(a.get("tamanho") or "")
+        tipo_doc = (a.get("tipoDocumento") or "").upper()
+        saida.append(
+            {
+                "ordem": ordem,
+                "id_documento": str(a.get("protocoloFormatado") or ""),
+                "id_interno": str(d.get("id") or ""),
+                "titulo": a.get("nomeComposto") or "",
+                "tipo": (a.get("tipo") or "").strip(),
+                "descricao": a.get("informacao") or "",
+                "origem": _ORIGEM.get(tipo_doc, tipo_doc),
+                "formato": a.get("mimeType") or "",
+                "arquivo": a.get("nome") or "",
+                "tamanho_bytes": int(tamanho) if tamanho.isdigit() else None,
+                "unidade": a.get("siglaUnidade") or "",
+                "assinado_no_sei": st.get("documentoAssinado") == "S",
+                "restrito": st.get("documentoRestrito") == "S",
+                "cancelado": st.get("documentoCancelado") == "S",
+            }
+        )
+    return saida
+
+
+def sem_acento(texto: str) -> str:
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", texto.lower()) if not unicodedata.combining(ch)
+    )
+
+
+def filtrar_arvore(arvore: list[dict[str, Any]], filtro: str) -> list[dict[str, Any]]:
+    """Mantém os documentos cujo título, descrição, arquivo ou nº SEI contém `filtro`."""
+    alvo = sem_acento(filtro.strip())
+    if not alvo:
+        return arvore
+    return [
+        d
+        for d in arvore
+        if alvo in sem_acento(" ".join((d["titulo"], d["descricao"], d["arquivo"], d["id_documento"])))
+    ]
+
+
+def pagina_para_texto(h: str) -> str:
+    """HTML de página inteira (documento renderizado) → texto, sem <head>, CSS e scripts."""
+    t = re.sub(r"(?is)<(script|style|head)\b.*?</\1\s*>", "", h)
+    t = re.sub(r"(?i)<br\s*/?>", "\n", t)
+    t = re.sub(r"(?i)</t[dh]\s*>", "\t", t)
+    t = re.sub(r"(?i)</p\s*>", "\n\n", t)
+    t = re.sub(r"(?i)</(div|tr|li|h[1-6]|table)\s*>", "\n", t)
+    t = re.sub(r"<[^>]+>", "", t)
+    t = html.unescape(t).replace("\xa0", " ")
+    linhas = [re.sub(r"[ \t]+", " ", linha).strip() for linha in t.split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(linhas)).strip()
+
+
+def _nome_seguro(nome: str) -> str:
+    nome = unicodedata.normalize("NFC", nome)
+    nome = re.sub(r'[/\\:*?"<>|\x00-\x1f]', "_", nome).strip(" .")
+    return nome[:150] or "documento"
+
+
+def _pagina_utf8(pagina: str) -> str:
+    """O SEI declara iso-8859-1; o arquivo local é gravado em UTF-8."""
+    pagina, n = re.subn(r"""(?i)charset=(["']?)iso-8859-1""", r"charset=\1utf-8", pagina)
+    if not n and "charset=" not in pagina[:3000].lower():
+        pagina = re.sub(r"(?i)(<head[^>]*>)", r'\1<meta charset="utf-8">', pagina, count=1)
+    return pagina
+
+
+def baixar_documento(
+    rest: SeiRest, numero: str, id_documento: str, pasta_processo: Path, forcar: bool = False
+) -> dict[str, Any]:
+    """Baixa UM documento (nº SEI visível ou id interno) para `pasta_processo/documentos/`.
+
+    Externo: arquivo original, reaproveitado do disco se já estiver lá com o
+    mesmo tamanho (a não ser com `forcar`). Interno/formulário: HTML
+    renderizado, sempre rebaixado (minuta muda a cada edição).
+    """
+    s = str(id_documento).strip()
+    doc = next(
+        (d for d in arvore_processo(rest, numero) if s in (d["id_documento"], d["id_interno"])),
+        None,
+    )
+    if doc is None:
+        raise SeiRestError(f"documento {s} não está no processo {numero}")
+    pasta = pasta_processo / "documentos"
+    prefixo = doc["id_documento"] or doc["id_interno"]
+    do_cache = False
+
+    if doc["origem"] == "externo":
+        destino = None
+        if doc["arquivo"]:
+            destino = pasta / _nome_seguro(f"{prefixo}_{doc['arquivo']}")
+            do_cache = (
+                not forcar
+                and destino.exists()
+                and doc["tamanho_bytes"] is not None
+                and destino.stat().st_size == doc["tamanho_bytes"]
+            )
+        if not do_cache:
+            r = rest.baixar_conteudo_documento(doc["id_interno"])
+            if "conteudo" not in r:
+                raise SeiRestError(f"documento {s}: o SEI não devolveu o arquivo do anexo")
+            if destino is None:
+                nome = r.get("nome_arquivo") or f"{doc['tipo'] or 'documento'}.{doc['formato'] or 'bin'}"
+                destino = pasta / _nome_seguro(f"{prefixo}_{nome}")
+            pasta.mkdir(parents=True, exist_ok=True)
+            destino.write_bytes(r["conteudo"])
+    else:
+        r = rest.baixar_conteudo_documento(doc["id_interno"])
+        if "html" not in r:
+            raise SeiRestError(f"documento {s}: o SEI não devolveu o HTML do documento")
+        base = re.sub(rf"\s*\(?{re.escape(prefixo)}\)?\s*$", "", doc["titulo"]).strip() or doc["tipo"]
+        destino = pasta / _nome_seguro(f"{prefixo}_{base}.html")
+        pasta.mkdir(parents=True, exist_ok=True)
+        destino.write_text(_pagina_utf8(html.unescape(r["html"])), encoding="utf-8")
+
+    return {
+        **doc,
+        "numero": numero,
+        "arquivo_local": str(destino),
+        "tamanho_bytes": destino.stat().st_size,
+        "do_cache": do_cache,
+    }

@@ -1,6 +1,6 @@
 """Servidor MCP do SEI-PMT.
 
-Expõe 18 tools ao Claude Desktop (12 de leitura/planilha/minutas via browser ou REST + 6 de documentos via REST, das quais 2 escrevem no SEI mediante confirmar=true):
+Expõe 20 tools ao Claude Desktop (12 de leitura/planilha/minutas via browser ou REST + 8 de documentos via REST, das quais 2 escrevem no SEI mediante confirmar=true):
   - listar_pendentes
   - gerar_planilha_controle
   - baixar_processo
@@ -34,7 +34,7 @@ from .planilha import (
     gerar_planilha,
     status_minuta_por_numero,
 )
-from .sei_client import SeiClient
+from .sei_client import DESTINO_DOWNLOAD, SeiClient
 from .sei_rest import get_rest
 
 mcp = FastMCP("sei-mcp")
@@ -736,7 +736,9 @@ async def salvar_minuta_processo(
 # Documentos no SEI via API REST (26/09/2026)
 #
 # Leitura: listar_tipos_documento_sei, listar_estilos_sei, formatar_html_sei,
-#          ler_documento_sei.
+#          ler_documento_sei, listar_documentos_sei, baixar_documento_sei
+#          (as duas últimas, de 05/10/2026: árvore e UM documento, sem
+#          baixar o processo inteiro).
 # ESCRITA (única exceção à regra "só leitura" do projeto): criar_documento_sei
 #          e editar_documento_sei. Ambas exigem `confirmar=True` NA MESMA
 #          CHAMADA; sem isso devolvem só a prévia e nada é gravado. Não há e
@@ -831,6 +833,124 @@ async def ler_documento_sei(id_documento: str, numero: str | None = None) -> dic
 
 
 @mcp.tool()
+async def listar_documentos_sei(numero: str, filtro: str = "", ultimos: int = 0) -> dict[str, Any]:
+    """Árvore do processo via API (sem browser, sem download): cada documento com
+    nº SEI, título, descrição, origem (externo/interno/formulario), formato,
+    tamanho, unidade e se está assinado, restrito ou cancelado. Só leitura.
+
+    Use ANTES de baixar: localize o documento que interessa e peça só ele com
+    `baixar_documento_sei`, em vez de baixar o processo inteiro.
+
+    Args:
+        numero: NUP do processo (ex.: '00097.000546/2026-36').
+        filtro: trecho a procurar em título, descrição, nome do arquivo ou nº SEI
+            (sem diferenciar maiúsculas nem acentos). Vazio = todos.
+        ultimos: se > 0, devolve só os N últimos documentos da árvore.
+    """
+    from . import sei_docs
+
+    def _f() -> dict[str, Any]:
+        arvore = sei_docs.arvore_processo(get_rest(), numero)
+        docs = sei_docs.filtrar_arvore(arvore, filtro)
+        if ultimos > 0:
+            docs = docs[-ultimos:]
+        # saída enxuta: campo vazio e flag falsa (restrito/cancelado) não aparecem
+        enxutos = [
+            {k: v for k, v in d.items() if v not in ("", None) and (v is not False or k == "assinado_no_sei")}
+            for d in docs
+        ]
+        return {
+            "numero": numero,
+            "total_no_processo": len(arvore),
+            "n_listados": len(enxutos),
+            "documentos": enxutos,
+        }
+
+    return await asyncio.to_thread(_f)
+
+
+def _texto_do_arquivo(path: Path, max_chars: int) -> dict[str, Any]:
+    """Texto de um documento baixado (PDF, DOCX, HTML ou texto puro), truncado em max_chars."""
+    from . import sei_docs
+
+    ext = path.suffix.lower()
+    extra: dict[str, Any] = {}
+    if ext == ".pdf":
+        r = extrair_texto_pdf(path)
+        texto = r["texto"]
+        extra["n_paginas"] = r["n_paginas"]
+        if len(texto) < 40 * max(r["n_paginas"], 1):
+            extra["aviso"] = (
+                "PDF sem camada de texto (escaneado): leia as páginas de `arquivo_local` "
+                "como imagem ou passe OCR."
+            )
+    elif ext == ".docx":
+        from docx import Document
+        from docx.table import Table
+
+        partes: list[str] = []
+        for bloco in Document(str(path)).iter_inner_content():
+            if isinstance(bloco, Table):
+                partes.extend("\t".join(c.text for c in linha.cells) for linha in bloco.rows)
+            else:
+                partes.append(bloco.text)
+        texto = "\n".join(partes).strip()
+    elif ext in (".html", ".htm"):
+        texto = sei_docs.pagina_para_texto(path.read_text(encoding="utf-8", errors="replace"))
+    elif ext in (".txt", ".csv", ".md", ".xml", ".json"):
+        texto = path.read_text(encoding="utf-8", errors="replace")
+    else:
+        return {
+            "texto": None,
+            "aviso": f"formato {ext or '(sem extensão)'} não tem extração de texto; abra `arquivo_local`.",
+        }
+    return {"texto": texto[:max_chars], "n_chars": len(texto), "truncado": len(texto) > max_chars, **extra}
+
+
+@mcp.tool()
+async def baixar_documento_sei(
+    numero: str,
+    id_documento: str,
+    incluir_texto: bool = True,
+    max_chars: int = 60000,
+    forcar: bool = False,
+) -> dict[str, Any]:
+    """Baixa UM documento do processo via API (sem browser) e devolve o texto dele.
+    Externo (PDF, DOCX, imagem): o arquivo original. Interno ou formulário
+    (Despacho, Parecer, E-mail, Recibo): o HTML renderizado. Só leitura.
+
+    Prefira esta tool a `baixar_processo` sempre que precisar de um documento
+    específico (ex.: o anexo que não veio no PDF do processo). Para descobrir
+    o nº SEI, use `listar_documentos_sei`.
+
+    Salvo em `~/Library/Mobile Documents/com~apple~CloudDocs/Processos SEI/
+    {numero}/documentos/{nº SEI}_{nome}`.
+
+    Args:
+        numero: NUP do processo (ex.: '00097.000546/2026-36').
+        id_documento: nº SEI visível (ex.: '16895235') ou id interno.
+        incluir_texto: devolve o texto extraído (PDF, DOCX, HTML). Default True.
+        max_chars: limite do texto devolvido; `truncado` avisa se cortou.
+        forcar: rebaixa o externo mesmo que já esteja em disco com o mesmo tamanho.
+
+    Returns:
+        dict com os dados do documento na árvore + `arquivo_local`,
+        `tamanho_bytes`, `do_cache` e, se pedido, `texto`, `n_chars`,
+        `truncado`, `n_paginas` (PDF) e `aviso` (PDF escaneado, formato sem texto).
+    """
+    from . import sei_docs
+
+    def _f() -> dict[str, Any]:
+        pasta = DESTINO_DOWNLOAD / numero.replace("/", "-")
+        info = sei_docs.baixar_documento(get_rest(), numero, id_documento, pasta, forcar=forcar)
+        if incluir_texto:
+            info.update(_texto_do_arquivo(Path(info["arquivo_local"]), max_chars))
+        return info
+
+    return await asyncio.to_thread(_f)
+
+
+@mcp.tool()
 async def criar_documento_sei(
     numero: str,
     tipo: str,
@@ -863,7 +983,7 @@ async def criar_documento_sei(
             "tipo_documento": nome_tipo,
             "id_serie": id_serie,
             "descricao": descricao,
-            "unidade": "PROC-PRFMAP-PGM",
+            "unidade": rest.unidade_sigla,
         }
         if not confirmar:
             return {"gravado": False, "previa": previa, "instrucao": _SEM_CONFIRMACAO}
